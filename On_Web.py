@@ -52,12 +52,12 @@ MAX_TOKENS = 512
 # Download model folder from S3 if not already downloaded
 def download_model_folder_from_s3(bucket: str, prefix: str, local_dir: str):
     if Path(local_dir).exists():
-        st.write(f"✔️ Model already cached at `{local_dir}`.")
+        # st.write(f"✔️ Model already cached at `{local_dir}`.")
         return
 
     s3 = boto3.client("s3")
     paginator = s3.get_paginator("list_objects_v2")
-    st.write(f"⬇ Downloading model files from `s3://{bucket}/{prefix}`...")
+    # st.write(f"⬇ Downloading model files from `s3://{bucket}/{prefix}`...")
     
     for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
         for obj in page.get("Contents", []):
@@ -66,7 +66,7 @@ def download_model_folder_from_s3(bucket: str, prefix: str, local_dir: str):
             local_path = os.path.join(local_dir, rel_path)
             os.makedirs(os.path.dirname(local_path), exist_ok=True)
             s3.download_file(bucket, s3_key, local_path)
-            st.write(f"  ✅ {rel_path}")
+            # st.write(f"  ✅ {rel_path}")
 
 # --------------------
 # Load models and tokenizers
@@ -113,7 +113,7 @@ def predict_smell_for_text(model, tokenizer, text: str) -> str:
 def main():
     st.set_page_config(page_title="Code Smell Detector", layout="wide")
     st.title("🧠 Code Smell Detector")
-    st.write("Paste your code below to detect code smells using CodeBERT and CodeT5.")
+    st.write("Paste your code below to detect 4 type of code smells: Data Class, God Class, Feature Envy & Long Method.")
 
     models, tokenizers = load_models_and_tokenizers()
 
