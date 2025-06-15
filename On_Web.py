@@ -10,6 +10,19 @@ from pathlib import Path
 # Config
 BUCKET_NAME = "weightmodel"  # No "s3://"
 
+# Load secrets from Streamlit's secrets.toml
+aws_access_key = st.secrets["AWS_ACCESS_KEY_ID"]
+aws_secret_key = st.secrets["AWS_SECRET_ACCESS_KEY"]
+region = st.secrets.get("AWS_DEFAULT_REGION", "us-east-1")  # or your region
+
+# Create boto3 S3 client using credentials
+s3 = boto3.client(
+    "s3",
+    aws_access_key_id=aws_access_key,
+    aws_secret_access_key=aws_secret_key,
+    region_name=region
+)
+
 MODEL_INFO = {
     "Data Class": {
         "s3_prefix": "data class/CodeT5_Data_Class",  # folder in S3
