@@ -40,7 +40,7 @@ MODEL_INFO = {
         "tokenizer_name": "microsoft/codebert-base",
     },
     "Long Method": {
-        "s3_prefix": "long method/Cbest_CodeT5_Long_Method_batch_size_64_seq_len_512_lr_1e-05_scheduler_linear_chunk_static_logic_name_combined_Time_20250221-041313",
+        "s3_prefix": "long method/best_CodeT5_Long_Method_batch_size_64_seq_len_512_lr_1e-05_scheduler_linear_chunk_static_logic_name_combined_Time_20250221-041313",
         "local_dir": "models/long_method",
         "tokenizer_name": "Salesforce/codet5-base",
     },
