@@ -159,8 +159,5 @@ def main():
 
             st.markdown(f"{emoji} **{smell}:** <span style='color:{color}'>{result}</span>", unsafe_allow_html=True)
 
-            if smell == "Feature Envy" and result == "Smell":
-                st.markdown("<span style='color:red'>*⚠️ This result is not reliable.*</span>", unsafe_allow_html=True)
-
 if __name__ == "__main__":
     main()
