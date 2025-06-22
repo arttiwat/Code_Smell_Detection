@@ -119,7 +119,7 @@ def predict_smell_for_text(model, tokenizer, text: str) -> Tuple[str, int, int]:
 def main():
     st.set_page_config(page_title="Code Smell Detector", layout="wide")
     st.title("🧠 Code Smell Detector")
-    st.write("Paste your code below to detect 4 type of code smells: Data Class, God Class & Long Method.")
+    st.write("Paste your code below to detect 3 type of code smells: Data Class, God Class & Long Method.")
 
     models, tokenizers = load_models_and_tokenizers()
 
