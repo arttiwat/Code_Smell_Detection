@@ -139,22 +139,28 @@ def main():
             result, total_chunks, total_tokens = predict_smell_for_text(model, tokenizer, code_input)
             results[smell] = result
 
-            # Store info from first run only
             if chunk_info is None:
                 chunk_info = (total_chunks, total_tokens)
 
-        # Show Input Data Info
+        # Show Input Info
         st.subheader("📄 Input Data Information")
         st.write(f"**Total Chunks:** {chunk_info[0]}")
         st.write(f"**Total Tokens:** {chunk_info[1]}")
 
-        # Show Predictions
+        # Show Prediction Results
         st.subheader("📊 Prediction Results")
         for smell, result in results.items():
-            emoji = "⚠️" if result == "Smell" else "✅"
-            st.write(f"{emoji} **{smell}:** {result}")
-            if smell == "Feature Envy":
-                st.markdown("*⚠️ This result is not reliable.*")
+            if result == "Smell":
+                color = "red"
+                emoji = "⚠️"
+            else:
+                color = "green"
+                emoji = "✅"
+
+            st.markdown(f"{emoji} **{smell}:** <span style='color:{color}'>{result}</span>", unsafe_allow_html=True)
+
+            if smell == "Feature Envy" and result == "Smell":
+                st.markdown("<span style='color:red'>*⚠️ This result is not reliable.*</span>", unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
