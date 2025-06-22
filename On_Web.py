@@ -34,11 +34,11 @@ MODEL_INFO = {
         "local_dir": "models/god_class",
         "tokenizer_name": "Salesforce/codet5-base",
     },
-    "Feature Envy": {
-        "s3_prefix": "feature envy/best_CodeBERT_Feature_Envy_batch_size_64_seq_len_512_lr_1e-05_scheduler_linear_chunk_static_logic_name_combined_Time_20250225-111507",
-        "local_dir": "models/feature_envy",
-        "tokenizer_name": "microsoft/codebert-base",
-    },
+    # "Feature Envy": {
+    #     "s3_prefix": "feature envy/best_CodeBERT_Feature_Envy_batch_size_64_seq_len_512_lr_1e-05_scheduler_linear_chunk_static_logic_name_combined_Time_20250225-111507",
+    #     "local_dir": "models/feature_envy",
+    #     "tokenizer_name": "microsoft/codebert-base",
+    # },
     "Long Method": {
         "s3_prefix": "long method/best_CodeT5_Long_Method_batch_size_64_seq_len_512_lr_1e-05_scheduler_linear_chunk_static_logic_name_combined_Time_20250221-041313",
         "local_dir": "models/long_method",
@@ -119,7 +119,7 @@ def predict_smell_for_text(model, tokenizer, text: str) -> Tuple[str, int, int]:
 def main():
     st.set_page_config(page_title="Code Smell Detector", layout="wide")
     st.title("🧠 Code Smell Detector")
-    st.write("Paste your code below to detect 4 type of code smells: Data Class, God Class, Feature Envy & Long Method.")
+    st.write("Paste your code below to detect 4 type of code smells: Data Class, God Class & Long Method.")
 
     models, tokenizers = load_models_and_tokenizers()
 
