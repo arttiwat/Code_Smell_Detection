@@ -3,7 +3,7 @@ import boto3
 import torch
 import streamlit as st
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
-from typing import List
+from typing import List, Tuple
 from pathlib import Path
 
 # --------------------
@@ -25,7 +25,7 @@ s3 = boto3.client(
 
 MODEL_INFO = {
     "Data Class": {
-        "s3_prefix": "data class/CodeT5_Data_Class",  # folder in S3
+        "s3_prefix": "data class/CodeT5_Data_Class",
         "local_dir": "models/data_class",
         "tokenizer_name": "Salesforce/codet5-base",
     },
@@ -52,13 +52,10 @@ MAX_TOKENS = 512
 # Download model folder from S3 if not already downloaded
 def download_model_folder_from_s3(bucket: str, prefix: str, local_dir: str):
     if Path(local_dir).exists():
-        # st.write(f"✔️ Model already cached at `{local_dir}`.")
         return
 
     s3 = boto3.client("s3")
     paginator = s3.get_paginator("list_objects_v2")
-    # st.write(f"⬇ Downloading model files from `s3://{bucket}/{prefix}`...")
-    
     for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
         for obj in page.get("Contents", []):
             s3_key = obj["Key"]
@@ -66,7 +63,6 @@ def download_model_folder_from_s3(bucket: str, prefix: str, local_dir: str):
             local_path = os.path.join(local_dir, rel_path)
             os.makedirs(os.path.dirname(local_path), exist_ok=True)
             s3.download_file(bucket, s3_key, local_path)
-            # st.write(f"  ✅ {rel_path}")
 
 # --------------------
 # Load models and tokenizers
@@ -84,11 +80,12 @@ def load_models_and_tokenizers():
 
 # --------------------
 # Chunking
-def chunk_text(tokenizer, text: str, max_tokens: int) -> List[str]:
+def chunk_text(tokenizer, text: str, max_tokens: int) -> Tuple[List[str], int]:
     tokens = tokenizer.encode(text, add_special_tokens=True)
-    chunks = [tokens[i:i + max_tokens] for i in range(0, len(tokens), max_tokens)]
-    return [tokenizer.decode(chunk, skip_special_tokens=True) for chunk in chunks]
-
+    total_tokens = len(tokens)
+    chunks = [tokens[i:i + max_tokens] for i in range(0, total_tokens, max_tokens)]
+    decoded_chunks = [tokenizer.decode(chunk, skip_special_tokens=True) for chunk in chunks]
+    return decoded_chunks, total_tokens
 
 # --------------------
 # Predict on chunk
@@ -110,12 +107,12 @@ def predict_chunk(model, tokenizer, chunk_text: str) -> int:
 
 # --------------------
 # Predict full text
-def predict_smell_for_text(model, tokenizer, text: str) -> str:
-    chunks = chunk_text(tokenizer, text, MAX_TOKENS)
+def predict_smell_for_text(model, tokenizer, text: str) -> Tuple[str, int, int]:
+    chunks, total_tokens = chunk_text(tokenizer, text, MAX_TOKENS)
     for chunk in chunks:
         if predict_chunk(model, tokenizer, chunk) == 1:
-            return "Smell"
-    return "Non-smell"
+            return "Smell", len(chunks), total_tokens
+    return "Non-smell", len(chunks), total_tokens
 
 # --------------------
 # Streamlit UI
@@ -135,15 +132,29 @@ def main():
 
         st.write("🔎 Analyzing...")
         results = {}
+        chunk_info = None
+
         for smell, model in models.items():
             tokenizer = tokenizers[smell]
-            result = predict_smell_for_text(model, tokenizer, code_input)
+            result, total_chunks, total_tokens = predict_smell_for_text(model, tokenizer, code_input)
             results[smell] = result
 
+            # Store info from first run only
+            if chunk_info is None:
+                chunk_info = (total_chunks, total_tokens)
+
+        # Show Input Data Info
+        st.subheader("📄 Input Data Information")
+        st.write(f"**Total Chunks:** {chunk_info[0]}")
+        st.write(f"**Total Tokens:** {chunk_info[1]}")
+
+        # Show Predictions
         st.subheader("📊 Prediction Results")
         for smell, result in results.items():
             emoji = "⚠️" if result == "Smell" else "✅"
             st.write(f"{emoji} **{smell}:** {result}")
+            if smell == "Feature Envy" and result == "Smell":
+                st.markdown("*⚠️ This result is not reliable.*")
 
 if __name__ == "__main__":
     main()
