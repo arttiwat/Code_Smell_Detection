@@ -139,7 +139,11 @@ def main():
 
         for smell, result in results.items():
             emoji = "⚠️" if result == "Smell" else "✅"
-            st.write(f"{emoji} **{smell}:** {result}")
+            if smell == "Feature Envy":
+                st.write(f"{emoji} **{smell}:** {result}  \n*⚠️ This result may be less reliable.*")
+            else:
+                st.write(f"{emoji} **{smell}:** {result}")
+
 
 # --------------------
 if __name__ == "__main__":
