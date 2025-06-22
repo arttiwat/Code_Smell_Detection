@@ -1,0 +1,936 @@
+import os
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import precision_recall_fscore_support, confusion_matrix
+from transformers import RobertaTokenizer, RobertaForSequenceClassification, get_scheduler, AdamW, get_linear_schedule_with_warmup
+import torch
+from torch.utils.data import DataLoader, TensorDataset
+from torch.optim import Adam
+from tqdm import tqdm
+import time
+from collections import defaultdict
+import argparse
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--train_dir",help="Directory for Train Folder", type=str)
+parser.add_argument("--validate_dir",help="Directory for Validate Folder", type=str)
+parser.add_argument("--test_dir",help="Directory for Test Folder", type=str)
+parser.add_argument("--batch", default=64, help="Batch Size (default=64)", type=int)
+parser.add_argument("--seq_len", default=512, help="Sequence Length (default=512)", type=int)
+parser.add_argument("--lr", default=1e-5, help="Learning Rate (default=1e-5)", type=float)
+parser.add_argument("--warm", default=100, help="Warmup Step (default=100)", type=int)
+parser.add_argument("--chunk_method", default="static", help="Chunking Method (default=static) [static,window]", type=str)
+parser.add_argument("--epoch", default=30, help="number of epoch (default=30)", type=int)
+parser.add_argument("--patience", default=5, help="Early Stop Patience (default=5)", type=int)
+parser.add_argument("--delta", default=0.001, help="Early Stop Delta (default=0.001)", type=float)
+parser.add_argument("--pt_dir", help="Directory for .pt file output", type=str)
+parser.add_argument("--weight_dir", help="Directory for weight file output", type=str)
+parser.add_argument("--result_dir", help="Directory for result file output", type=str)
+parser.add_argument("--cuda_dev", default="0", help="CUDA_VISIBLE_DEVICES (default=0)", type=str)
+args = parser.parse_args()
+
+os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda_dev
+set_time = time.strftime('%Y%m%d-%H%M%S')
+
+class EarlyStopping:
+    def __init__(self, patience, delta, save_dir='./', batch=None, seq_len=None, smell=None, Model=None, set_time=None, chunking_method = None, chunking_logic_name = None):
+        self.patience = patience
+        self.delta = delta
+        self.best_score = None
+        self.early_stop = False
+        self.counter = 0
+        self.save_dir = save_dir  # Save directory
+        self.batch = batch
+        self.smell = smell
+        self.Model = Model
+        self.seq_len = seq_len
+        self.set_time = set_time
+        self.chunking_method = chunking_method
+        self.chunking_logic_name = chunking_logic_name
+
+    def __call__(self, val_loss, model):
+        score = -val_loss
+        if self.best_score is None:
+            self.best_score = score
+            self.save_checkpoint(val_loss, model)
+        elif score < self.best_score + self.delta:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
+        else:
+            self.best_score = score
+            self.save_checkpoint(val_loss, model)
+            self.counter = 0
+
+    def save_checkpoint(self, val_loss, model):
+        '''Saves model when validation loss decreases.'''
+        os.makedirs(self.save_dir, exist_ok=True)  # Ensure the directory exists
+        # Generate the dynamic file name
+        file_name = f"Batch_{self.batch}_Seq_{self.seq_len}_ChunkText_{self.chunking_method}_ChunkLogic_{self.chunking_logic_name}_Time_{set_time}.pt"
+        checkpoint_path = os.path.join(self.save_dir, file_name)
+        torch.save(model.state_dict(), checkpoint_path)
+        print(f"Checkpoint saved to {checkpoint_path}")
+
+
+# Function to load dataset from specific folder
+def load_dataset(folder_path):
+    csv_file = os.path.join(folder_path, f"{os.path.basename(folder_path)}.csv")
+    df = pd.read_csv(csv_file)
+
+    # Convert severity labels to binary labels
+    df['label'] = df['severity'].apply(lambda x: 0 if x == 'none' else 1)
+
+    texts = []
+    labels = []
+    for _, row in df.iterrows():
+        file_path = os.path.join(folder_path, f"{row['id']}.txt")
+        with open(file_path, 'r') as file:
+            texts.append(file.read())
+        labels.append(row['label'])
+
+    return texts, labels, df
+
+# augment = "Split" ## bert-uncased, bert-cased, EDA, Original, Split
+# smell_folder = "Data Class" ## Data Class, Feature Envy, God Class, Long Method
+# smell = "Data_Class" ## Data_Class, Feature_Envy, God_Clas, Long Method
+Model = "CodeBERT"
+
+train_folder = args.train_dir
+val_folder = args.validate_dir
+test_folder = args.test_dir
+
+
+train_texts, train_labels, train_df = load_dataset(train_folder)
+val_texts, val_labels, val_df = load_dataset(val_folder)
+test_texts, test_labels, test_df = load_dataset(test_folder)
+
+# Initialize the tokenizer
+tokenizer = RobertaTokenizer.from_pretrained("microsoft/codebert-base")
+
+def chunk_text(text, max_length, sliding_window=False, overlap=0.5):
+    tokens = tokenizer.encode(text, add_special_tokens=False)
+    chunk_size = max_length - 2
+
+    start_token = tokenizer.cls_token_id
+    end_token = tokenizer.sep_token_id
+
+    chunks = []
+    if sliding_window:
+        stride = int(chunk_size * (1 - overlap))
+        for i in range(0, len(tokens), stride):
+            chunk = tokens[i:i + chunk_size]
+            if chunk:  # Ensure the chunk isn't empty
+                chunks.append([start_token] + chunk[:chunk_size] + [end_token])
+    else:
+        for i in range(0, len(tokens), chunk_size):
+            chunk = tokens[i:i + chunk_size]
+            chunks.append([start_token] + chunk[:chunk_size] + [end_token])
+
+    # Log chunks exceeding max_length for debugging
+    for chunk in chunks:
+        if len(chunk) > max_length:
+            print(f"Warning: Chunk of length {len(chunk)} exceeds max_length={max_length}")
+
+    return chunks
+
+
+
+def tokenize_data(texts, labels, max_length, sliding_window=False, overlap=0.5):
+    input_ids_list = []
+    attention_mask_list = []
+    label_list = []
+    text_ids_list = []
+
+    for text_index, (text, label) in enumerate(zip(texts, labels)):
+        chunks = chunk_text(text, max_length, sliding_window, overlap)
+        for chunk in chunks:
+            if len(chunk) > max_length:
+                print(f"Warning: Chunk length {len(chunk)} exceeds max_length={max_length}")
+            encoding = tokenizer.encode_plus(
+                chunk,
+                is_pretokenized=True,
+                padding='max_length',
+                truncation=True,
+                max_length=max_length,
+                return_tensors='pt'
+            )
+            input_ids_list.append(encoding['input_ids'].squeeze(0))
+            attention_mask_list.append(encoding['attention_mask'].squeeze(0))
+            label_list.append(label)
+            text_ids_list.append(text_index)
+
+    input_ids = torch.stack(input_ids_list)
+    attention_mask = torch.stack(attention_mask_list)
+    labels = torch.tensor(label_list)
+    text_ids = torch.tensor(text_ids_list)
+
+    return TensorDataset(input_ids, attention_mask, labels, text_ids)
+
+
+def print_severity_distribution(df, set_name):
+    severity_counts = df['severity'].value_counts().to_dict()
+    none = severity_counts.get('none', 0)
+    minor = severity_counts.get('minor', 0)
+    major = severity_counts.get('major', 0)
+    critical = severity_counts.get('critical', 0)
+    print(f"{set_name}: None={none}, Minor={minor}, Major={major}, Critical={critical}")
+
+def no_chunks_logic(text_predictions, labels):
+    # No chunks, process directly
+    correct = sum(
+        1 if preds[0] == labels[text_id] else 0
+        for text_id, preds in text_predictions.items()
+    )
+    total = len(text_predictions)
+    return correct, total
+
+def combined_chunks_logic(text_predictions, labels):
+    # Combine chunks: any chunk predicts 1 -> label 1
+    correct = sum(
+        1 if any(pred == 1 for pred in preds) == labels[text_id] else 0
+        for text_id, preds in text_predictions.items()
+    )
+    total = len(text_predictions)
+    return correct, total
+
+def majority_chunks_logic(text_predictions, labels):
+    # Majority voting logic
+    correct = sum(
+        1 if (preds.count(1) > preds.count(0)) == labels[text_id] else 0
+        for text_id, preds in text_predictions.items()
+    )
+    total = len(text_predictions)
+    return correct, total
+
+def compute_final_labels(data, logic="combined"):
+    """
+    Compute the final label for each ID based on the selected logic.
+
+    Parameters:
+        data (list): List of tuples, where each tuple is (torch.tensor(id, device), label).
+        logic (int): Logic to use for determining final label:
+            - Logic majority: Use majority vote for the predict label.
+            - Logic combined: If any predict label is 1, the final label is 1.
+
+    Returns:
+        list: List of tuples in the format (id, final_label).
+    """
+    if isinstance(data, dict):  # Check if `data` is a dictionary
+        data = [(key, value) for key, value in data.items()] 
+
+    # Group predictions by ID
+    id_to_labels = defaultdict(list)
+    for tensor_id, label in data:
+        id_to_labels[int(tensor_id.item())].append(label)
+
+    # Compute final labels based on selected logic
+    results = []
+    for tensor_id, labels in id_to_labels.items():
+        if logic == "majority":
+            # Logic 1: Majority vote
+            final_label = 1 if labels.count(1) > labels.count(0) else 0
+        elif logic == "combined":
+            # Logic 2: If any label is 1, the result is 1
+            final_label = 1 if 1 in labels else 0
+        else:
+            raise ValueError("Invalid logic specified. Use 1 or 2.")
+        results.append((tensor_id, final_label))
+
+    return results
+
+def Combine_chunks_logic(text_predictions, labels):
+    """
+    Combine logic: Predict label 1 if any chunk predicts 1.
+    """
+    correct = 0
+    total = 0
+    all_preds = []
+    all_labels = []
+    
+    for text_id, preds in text_predictions.items():
+        # Final prediction is 1 if any chunk predicts 1
+        combined_vote = 1 if 1 in preds else 0
+        if combined_vote == labels[text_id]:
+            correct += 1
+        total += 1
+        all_preds.append(combined_vote)
+        all_labels.append(labels[text_id])
+    
+    # Compute confusion matrix
+    conf_matrix = confusion_matrix(all_labels, all_preds)
+    return correct, total, conf_matrix
+
+# Print severity distribution
+print_severity_distribution(train_df, "Train")
+print_severity_distribution(val_df, "Validate")
+print_severity_distribution(test_df, "Test")
+
+chunking_logic_map = {
+    # "none": no_chunks_logic,
+    "combined": combined_chunks_logic,
+    # "majority": majority_chunks_logic,
+}
+
+batch_sizes = [args.batch]
+sequence_lengths = [args.seq_len]
+learning_rates = [args.lr]
+scheduler_types = ["linear"] ## "linear", "cosine", "polynomial"
+# Define available scheduler types
+scheduler_options = {
+    "linear": get_linear_schedule_with_warmup,
+}
+warmup_steps = args.warm
+chunking_methods = [args.chunk_method]
+chunking_logics = list(chunking_logic_map.keys())
+
+best_model = None
+best_accuracy = 0
+best_config = None
+results = []
+
+for batch_size in batch_sizes:
+    for seq_len in sequence_lengths:
+        for lr in learning_rates:
+            for scheduler_type in scheduler_types:
+              for chunking_method in chunking_methods:
+                for chunking_logic_name, logic_function in chunking_logic_map.items():import os
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import precision_recall_fscore_support, confusion_matrix
+from transformers import RobertaTokenizer, RobertaForSequenceClassification, get_scheduler, AdamW, get_linear_schedule_with_warmup
+import torch
+from torch.utils.data import DataLoader, TensorDataset
+from torch.optim import Adam
+from tqdm import tqdm
+import time
+from collections import defaultdict
+import argparse
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--train_dir",help="Directory for Train Folder", type=str)
+parser.add_argument("--validate_dir",help="Directory for Validate Folder", type=str)
+parser.add_argument("--test_dir",help="Directory for Test Folder", type=str)
+parser.add_argument("--batch", default=64, help="Batch Size (default=64)", type=int)
+parser.add_argument("--seq_len", default=512, help="Sequence Length (default=512)", type=int)
+parser.add_argument("--lr", default=1e-5, help="Learning Rate (default=1e-5)", type=float)
+parser.add_argument("--warm", default=100, help="Warmup Step (default=100)", type=int)
+parser.add_argument("--chunk_method", default="static", help="Chunking Method (default=static) [static,window]", type=str)
+parser.add_argument("--epoch", default=30, help="number of epoch (default=30)", type=int)
+parser.add_argument("--patience", default=5, help="Early Stop Patience (default=5)", type=int)
+parser.add_argument("--delta", default=0.001, help="Early Stop Delta (default=0.001)", type=float)
+parser.add_argument("--pt_dir", help="Directory for .pt file output", type=str)
+parser.add_argument("--weight_dir", help="Directory for weight file output", type=str)
+parser.add_argument("--result_dir", help="Directory for result file output", type=str)
+parser.add_argument("--cuda_dev", default="0", help="CUDA_VISIBLE_DEVICES (default=0)", type=str)
+args = parser.parse_args()
+
+os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda_dev
+set_time = time.strftime('%Y%m%d-%H%M%S')
+
+class EarlyStopping:
+    def __init__(self, patience, delta, save_dir='./', batch=None, seq_len=None, smell=None, Model=None, set_time=None, chunking_method = None, chunking_logic_name = None):
+        self.patience = patience
+        self.delta = delta
+        self.best_score = None
+        self.early_stop = False
+        self.counter = 0
+        self.save_dir = save_dir  # Save directory
+        self.batch = batch
+        self.smell = smell
+        self.Model = Model
+        self.seq_len = seq_len
+        self.set_time = set_time
+        self.chunking_method = chunking_method
+        self.chunking_logic_name = chunking_logic_name
+
+    def __call__(self, val_loss, model):
+        score = -val_loss
+        if self.best_score is None:
+            self.best_score = score
+            self.save_checkpoint(val_loss, model)
+        elif score < self.best_score + self.delta:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
+        else:
+            self.best_score = score
+            self.save_checkpoint(val_loss, model)
+            self.counter = 0
+
+    def save_checkpoint(self, val_loss, model):
+        '''Saves model when validation loss decreases.'''
+        os.makedirs(self.save_dir, exist_ok=True)  # Ensure the directory exists
+        # Generate the dynamic file name
+        file_name = f"Batch_{self.batch}_Seq_{self.seq_len}_ChunkText_{self.chunking_method}_ChunkLogic_{self.chunking_logic_name}_Time_{set_time}.pt"
+        checkpoint_path = os.path.join(self.save_dir, file_name)
+        torch.save(model.state_dict(), checkpoint_path)
+        print(f"Checkpoint saved to {checkpoint_path}")
+
+
+# Function to load dataset from specific folder
+def load_dataset(folder_path):
+    csv_file = os.path.join(folder_path, f"{os.path.basename(folder_path)}.csv")
+    df = pd.read_csv(csv_file)
+
+    # Convert severity labels to binary labels
+    df['label'] = df['severity'].apply(lambda x: 0 if x == 'none' else 1)
+
+    texts = []
+    labels = []
+    for _, row in df.iterrows():
+        file_path = os.path.join(folder_path, f"{row['id']}.txt")
+        with open(file_path, 'r') as file:
+            texts.append(file.read())
+        labels.append(row['label'])
+
+    return texts, labels, df
+
+# augment = "Split" ## bert-uncased, bert-cased, EDA, Original, Split
+# smell_folder = "Data Class" ## Data Class, Feature Envy, God Class, Long Method
+# smell = "Data_Class" ## Data_Class, Feature_Envy, God_Clas, Long Method
+Model = "CodeBERT"
+
+train_folder = args.train_dir
+val_folder = args.validate_dir
+test_folder = args.test_dir
+
+
+train_texts, train_labels, train_df = load_dataset(train_folder)
+val_texts, val_labels, val_df = load_dataset(val_folder)
+test_texts, test_labels, test_df = load_dataset(test_folder)
+
+# Initialize the tokenizer
+tokenizer = RobertaTokenizer.from_pretrained("microsoft/codebert-base")
+
+def chunk_text(text, max_length, sliding_window=False, overlap=0.5):
+    tokens = tokenizer.encode(text, add_special_tokens=False)
+    chunk_size = max_length - 2
+
+    start_token = tokenizer.cls_token_id
+    end_token = tokenizer.sep_token_id
+
+    chunks = []
+    if sliding_window:
+        stride = int(chunk_size * (1 - overlap))
+        for i in range(0, len(tokens), stride):
+            chunk = tokens[i:i + chunk_size]
+            if chunk:  # Ensure the chunk isn't empty
+                chunks.append([start_token] + chunk[:chunk_size] + [end_token])
+    else:
+        for i in range(0, len(tokens), chunk_size):
+            chunk = tokens[i:i + chunk_size]
+            chunks.append([start_token] + chunk[:chunk_size] + [end_token])
+
+    # Log chunks exceeding max_length for debugging
+    for chunk in chunks:
+        if len(chunk) > max_length:
+            print(f"Warning: Chunk of length {len(chunk)} exceeds max_length={max_length}")
+
+    return chunks
+
+
+
+def tokenize_data(texts, labels, max_length, sliding_window=False, overlap=0.5):
+    input_ids_list = []
+    attention_mask_list = []
+    label_list = []
+    text_ids_list = []
+
+    for text_index, (text, label) in enumerate(zip(texts, labels)):
+        chunks = chunk_text(text, max_length, sliding_window, overlap)
+        for chunk in chunks:
+            if len(chunk) > max_length:
+                print(f"Warning: Chunk length {len(chunk)} exceeds max_length={max_length}")
+            encoding = tokenizer.encode_plus(
+                chunk,
+                is_pretokenized=True,
+                padding='max_length',
+                truncation=True,
+                max_length=max_length,
+                return_tensors='pt'
+            )
+            input_ids_list.append(encoding['input_ids'].squeeze(0))
+            attention_mask_list.append(encoding['attention_mask'].squeeze(0))
+            label_list.append(label)
+            text_ids_list.append(text_index)
+
+    input_ids = torch.stack(input_ids_list)
+    attention_mask = torch.stack(attention_mask_list)
+    labels = torch.tensor(label_list)
+    text_ids = torch.tensor(text_ids_list)
+
+    return TensorDataset(input_ids, attention_mask, labels, text_ids)
+
+
+def print_severity_distribution(df, set_name):
+    severity_counts = df['severity'].value_counts().to_dict()
+    none = severity_counts.get('none', 0)
+    minor = severity_counts.get('minor', 0)
+    major = severity_counts.get('major', 0)
+    critical = severity_counts.get('critical', 0)
+    print(f"{set_name}: None={none}, Minor={minor}, Major={major}, Critical={critical}")
+
+def no_chunks_logic(text_predictions, labels):
+    # No chunks, process directly
+    correct = sum(
+        1 if preds[0] == labels[text_id] else 0
+        for text_id, preds in text_predictions.items()
+    )
+    total = len(text_predictions)
+    return correct, total
+
+def combined_chunks_logic(text_predictions, labels):
+    # Combine chunks: any chunk predicts 1 -> label 1
+    correct = sum(
+        1 if any(pred == 1 for pred in preds) == labels[text_id] else 0
+        for text_id, preds in text_predictions.items()
+    )
+    total = len(text_predictions)
+    return correct, total
+
+def majority_chunks_logic(text_predictions, labels):
+    # Majority voting logic
+    correct = sum(
+        1 if (preds.count(1) > preds.count(0)) == labels[text_id] else 0
+        for text_id, preds in text_predictions.items()
+    )
+    total = len(text_predictions)
+    return correct, total
+
+def compute_final_labels(data, logic="combined"):
+    """
+    Compute the final label for each ID based on the selected logic.
+
+    Parameters:
+        data (list): List of tuples, where each tuple is (torch.tensor(id, device), label).
+        logic (int): Logic to use for determining final label:
+            - Logic majority: Use majority vote for the predict label.
+            - Logic combined: If any predict label is 1, the final label is 1.
+
+    Returns:
+        list: List of tuples in the format (id, final_label).
+    """
+    if isinstance(data, dict):  # Check if `data` is a dictionary
+        data = [(key, value) for key, value in data.items()] 
+
+    # Group predictions by ID
+    id_to_labels = defaultdict(list)
+    for tensor_id, label in data:
+        id_to_labels[int(tensor_id.item())].append(label)
+
+    # Compute final labels based on selected logic
+    results = []
+    for tensor_id, labels in id_to_labels.items():
+        if logic == "majority":
+            # Logic 1: Majority vote
+            final_label = 1 if labels.count(1) > labels.count(0) else 0
+        elif logic == "combined":
+            # Logic 2: If any label is 1, the result is 1
+            final_label = 1 if 1 in labels else 0
+        else:
+            raise ValueError("Invalid logic specified. Use 1 or 2.")
+        results.append((tensor_id, final_label))
+
+    return results
+
+def Combine_chunks_logic(text_predictions, labels):
+    """
+    Combine logic: Predict label 1 if any chunk predicts 1.
+    """
+    correct = 0
+    total = 0
+    all_preds = []
+    all_labels = []
+    
+    for text_id, preds in text_predictions.items():
+        # Final prediction is 1 if any chunk predicts 1
+        combined_vote = 1 if 1 in preds else 0
+        if combined_vote == labels[text_id]:
+            correct += 1
+        total += 1
+        all_preds.append(combined_vote)
+        all_labels.append(labels[text_id])
+    
+    # Compute confusion matrix
+    conf_matrix = confusion_matrix(all_labels, all_preds)
+    return correct, total, conf_matrix
+
+# Print severity distribution
+print_severity_distribution(train_df, "Train")
+print_severity_distribution(val_df, "Validate")
+print_severity_distribution(test_df, "Test")
+
+chunking_logic_map = {
+    # "none": no_chunks_logic,
+    "combined": combined_chunks_logic,
+    # "majority": majority_chunks_logic,
+}
+
+batch_sizes = [args.batch]
+sequence_lengths = [args.seq_len]
+learning_rates = [args.lr]
+scheduler_types = ["linear"] ## "linear", "cosine", "polynomial"
+# Define available scheduler types
+scheduler_options = {
+    "linear": get_linear_schedule_with_warmup,
+}
+warmup_steps = args.warm
+chunking_methods = [args.chunk_method]
+chunking_logics = list(chunking_logic_map.keys())
+
+best_model = None
+best_accuracy = 0
+best_config = None
+results = []
+
+for batch_size in batch_sizes:
+    for seq_len in sequence_lengths:
+        for lr in learning_rates:
+            for scheduler_type in scheduler_types:
+              for chunking_method in chunking_methods:
+                for chunking_logic_name, logic_function in chunking_logic_map.items():
+                    print(f"\nTraining with batch_size={batch_size}, seq_len={seq_len}, lr={lr}, scheduler={scheduler_type}, chunking={chunking_method}, logic_name={chunking_logic_name}, logic_function={logic_function}")
+
+                    # Determine parameters based on chunking method
+                    sliding_window = (chunking_method == "window")
+                    overlap = 0.5 if sliding_window else 0.0  # Use 50% overlap for sliding window
+
+                    train_dataset = tokenize_data(train_texts, train_labels, seq_len, sliding_window=sliding_window, overlap=overlap)
+                    val_dataset = tokenize_data(val_texts, val_labels, seq_len, sliding_window=sliding_window, overlap=overlap)
+                    test_dataset = tokenize_data(test_texts, test_labels, seq_len, sliding_window=sliding_window, overlap=overlap)
+
+                    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+                    val_loader = DataLoader(val_dataset, batch_size=batch_size)
+                    test_loader = DataLoader(test_dataset, batch_size=batch_size)
+
+                    model = RobertaForSequenceClassification.from_pretrained("microsoft/codebert-base", num_labels=2)
+                    model = model.to("cuda")
+                    model.gradient_checkpointing_enable()
+
+                    optimizer = AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+                    num_epochs = args.epoch
+                    num_training_steps = num_epochs * len(train_loader)
+
+                    lr_scheduler = scheduler_options[scheduler_type](
+                        optimizer,
+                        num_warmup_steps=warmup_steps,
+                        num_training_steps=num_training_steps,
+                    )
+
+                    early_stopping = EarlyStopping(
+                        patience=args.patience, 
+                        delta=args.delta,
+                        batch = batch_size,
+                        seq_len=seq_len,
+                        chunking_method = chunking_method, 
+                        chunking_logic_name = chunking_logic_name,
+			            save_dir=args.pt_dir,
+                        )
+
+
+                    train_accuracies = []
+                    val_accuracies = []
+                    val_losses = []
+
+                    progress_bar = tqdm(total=num_epochs, desc="Training and Validation Progress")
+
+                    for epoch in range(num_epochs):
+                        model.train()
+                        correct_train = 0
+                        total_train = 0
+                        text_predictions = {}
+
+
+                        for batch in train_loader:
+                            input_ids, attention_mask, labels, text_ids = [b.to("cuda") for b in batch]
+                            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+                            loss = outputs.loss
+                            loss.backward()
+
+                            optimizer.step()
+                            lr_scheduler.step()
+                            optimizer.zero_grad()
+
+                            predictions = torch.argmax(outputs.logits, dim=-1).cpu().numpy()
+
+                           # Group predictions by text ID
+                            for text_id, pred in zip(text_ids.cpu().numpy(), predictions):  
+                                if text_id not in text_predictions:
+                                    text_predictions[text_id] = []
+                                text_predictions[text_id].append(pred)
+
+                            # Apply chunking logic function for training
+                        correct_train, total_train, train_conf_matrix = Combine_chunks_logic(text_predictions, train_labels)
+
+                        train_accuracy = correct_train / total_train if total_train > 0 else 0
+                        train_accuracies.append(train_accuracy)
+                        print(f"Epoch {epoch+1}/{num_epochs} - Train Confusion Matrix:")
+                        print(train_conf_matrix)
+                        print(f"Train Accuracy: {train_accuracy:.4f}")
+
+                        model.eval()
+                        correct_val = 0
+                        total_val = 0
+                        val_loss = 0
+
+                        text_val_predictions = {}
+
+                        with torch.no_grad():
+                            for batch in val_loader:
+                                input_ids, attention_mask, labels, text_ids = [b.to("cuda") for b in batch]
+
+                                # Forward pass through the model
+                                outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+                                loss = outputs.loss
+                                val_loss += loss.item()  # Accumulate validation loss
+
+                                # Get predictions
+                                predictions = torch.argmax(outputs.logits, dim=-1).cpu().numpy()
+
+                                # Print predictions and labels
+                                labels_np = labels.cpu().numpy()  # Convert labels to numpy for comparison
+
+                                # Group predictions by text ID for validation
+                                for text_id, pred in zip(text_ids.cpu().numpy(), predictions):
+                                    if text_id not in text_val_predictions:
+                                        text_val_predictions[text_id] = []
+                                    text_val_predictions[text_id].append(pred)
+
+                                correct_val, total_val, val_conf_matrix = Combine_chunks_logic(text_val_predictions, val_labels)
+
+                        val_accuracy = correct_val / total_val if total_val > 0 else 0
+                        val_accuracies.append(val_accuracy)
+                        val_losses.append(val_loss)
+
+                        print(f"Epoch {epoch+1}/{num_epochs} - Validation Confusion Matrix:")
+                        print(val_conf_matrix)
+                        print(f"Validation Accuracy: {val_accuracy:.4f}")
+
+                        early_stopping(val_loss, model)
+
+
+                        if early_stopping.early_stop:
+                            print("Early stopping")
+                            print(f"Stopped at Epoch {epoch+1}/{num_epochs} - Train Accuracy: {train_accuracy:.4f} - Validation Accuracy: {val_accuracy:.4f} - Validation Loss: {val_loss:.4f}")
+                            break
+
+                        if val_accuracy > best_accuracy:
+                            best_accuracy = val_accuracy
+                            torch.save(model.state_dict(), 'checkpoint.pt')
+                            best_config = {
+                                'batch_size': batch_size,
+                                'seq_len': seq_len,
+                                'learning_rate': lr,
+                                'scheduler_type': scheduler_type,
+                                'train_accuracy': train_accuracy,
+                                'val_accuracy': val_accuracy,
+                                'val_loss': val_loss,
+                                'chunking_method': chunking_method,
+                                'chunking_logic_name': chunking_logic_name,
+                                'logic_function' : logic_function
+                            }
+
+                        progress_bar.update(1)
+
+                    progress_bar.close()
+
+                    results.append({
+                        'batch_size': batch_size,
+                        'seq_len': seq_len,
+                        'learning_rate': lr,
+                        'scheduler_type': scheduler_type,
+                        'train_accuracies': train_accuracies,
+                        'val_accuracies': val_accuracies,
+                        'val_losses': val_losses,
+                        'chunking_method': chunking_method,
+                        'chunking_logic_name': chunking_logic_name,
+                        'logic_function' : logic_function
+                    })
+
+
+# Construct the file name
+checkpoint_name = f"Batch_{batch_size}_Seq_{seq_len}_ChunkText_{chunking_method}_ChunkLogic_{chunking_logic_name}_Time_{set_time}.pt"
+
+# Define the directory where the checkpoint is saved
+check_save_dir = args.pt_dir
+checkpoint_path = os.path.join(check_save_dir, checkpoint_name)
+
+# Load the last checkpoint with the best model
+best_model = RobertaForSequenceClassification.from_pretrained("microsoft/codebert-base", num_labels=2)
+state_dict = torch.load(checkpoint_path)
+best_model.load_state_dict(state_dict)
+best_model = best_model.to("cuda")
+best_model.gradient_checkpointing_enable()
+
+# Save the best model
+save_path = args.weight_dir
+os.makedirs(save_path, exist_ok = True)
+best_model.save_pretrained(save_path)
+tokenizer.save_pretrained(save_path)
+
+# Evaluate on test set
+best_model.eval()
+true_labels = []
+pred_labels = []
+
+text_test_predictions = {}
+
+### Validation
+
+with torch.no_grad():
+    for batch in val_loader:
+        input_ids, attention_mask, labels, text_ids = [b.to("cuda") for b in batch]
+
+        # Forward pass through the model
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+        
+        # Get predictions
+        predictions = torch.argmax(outputs.logits, dim=-1).cpu().numpy()  # Convert predictions to numpy
+        labels_np = labels.cpu().numpy()  # Convert labels to numpy
+
+        # Group predictions by text ID
+        for text_id, pred in zip(text_ids.cpu().numpy(), predictions):
+            if text_id not in text_val_predictions:
+                text_val_predictions[text_id] = []
+            text_val_predictions[text_id].append(pred)
+
+logic_function = best_config['chunking_logic_name']
+
+# Debug: Check the type of logic_function
+print("Best Config: ", best_config)
+print("Set Time: ", set_time)
+print("Logic function:", logic_function)
+print("Logic function type:", type(logic_function))
+print("Model:", Model)
+
+# Match the type of chunking_logic_map keys to the type of logic_function
+if isinstance(logic_function, str):
+    chunking_logic_map = {
+        "none": no_chunks_logic,
+        "combined": combined_chunks_logic,
+        "majority": majority_chunks_logic,
+    }
+elif callable(logic_function):
+    chunking_logic_map = {
+        no_chunks_logic: no_chunks_logic,
+        combined_chunks_logic: combined_chunks_logic,
+        majority_chunks_logic: majority_chunks_logic,
+    }
+else:
+    raise ValueError(f"Unsupported logic_function type: {type(logic_function)}")
+
+print("Number of predictions:", len(text_val_predictions))
+print("Number of labels:", len(val_labels))
+
+correct_val, total_val, val_conf_matrix = Combine_chunks_logic(text_val_predictions, val_labels)
+
+# Extract values from confusion matrix
+TN, FP = val_conf_matrix[0]
+FN, TP = val_conf_matrix[1]
+
+# Compute Precision, Recall, F1-score
+precision = TP / (TP + FP) if (TP + FP) > 0 else 0
+recall = TP / (TP + FN) if (TP + FN) > 0 else 0
+f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+
+# Print Metrics
+print(f"Validation Precision: {precision:.4f}")
+print(f"Validation Recall: {recall:.4f}")
+print(f"Validation F1 Score: {f1:.4f}")
+
+# Print Confusion Matrix
+print("Validation Confusion Matrix:")
+print(val_conf_matrix)
+
+# Save confusion matrix as CSV
+conf_matrix_df = pd.DataFrame(val_conf_matrix, index=['True_0', 'True_1'], columns=['Pred_0', 'Pred_1'])
+conf_matrix_df.to_csv(f'{args.result_dir}/{Model}_val_confusion_matrix_Time_{set_time}.csv', index=True)
+
+### Test
+true_labels = []
+pred_labels = []
+
+text_test_predictions = {}
+
+with torch.no_grad():
+    for batch in test_loader:
+        input_ids, attention_mask, labels, text_ids = [b.to("cuda") for b in batch]
+
+        # Forward pass through the model
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+        
+        # Get predictions
+        predictions = torch.argmax(outputs.logits, dim=-1).cpu().numpy()  # Convert predictions to numpy
+        labels_np = labels.cpu().numpy()  # Convert labels to numpy
+
+        # Group predictions by text ID
+        for text_id, pred in zip(text_ids.cpu().numpy(), predictions):
+            if text_id not in text_test_predictions:
+                text_test_predictions[text_id] = []
+            text_test_predictions[text_id].append(pred)
+
+logic_function = best_config['chunking_logic_name']
+
+if isinstance(logic_function, str):
+    chunking_logic_map = {
+        "none": no_chunks_logic,
+        "combined": combined_chunks_logic,
+        "majority": majority_chunks_logic,
+    }
+elif callable(logic_function):
+    chunking_logic_map = {
+        no_chunks_logic: no_chunks_logic,
+        combined_chunks_logic: combined_chunks_logic,
+        majority_chunks_logic: majority_chunks_logic,
+    }
+else:
+    raise ValueError(f"Unsupported logic_function type: {type(logic_function)}")
+
+print("Number of predictions:", len(text_test_predictions))
+print("Number of labels:", len(test_labels))
+
+correct_test, total_test, test_conf_matrix = Combine_chunks_logic(text_test_predictions, test_labels)
+
+# Extract values from confusion matrix
+TN, FP = test_conf_matrix[0]
+FN, TP = test_conf_matrix[1]
+
+# Compute Precision, Recall, F1-score
+precision = TP / (TP + FP) if (TP + FP) > 0 else 0
+recall = TP / (TP + FN) if (TP + FN) > 0 else 0
+f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+
+print(f"Test Precision: {precision:.4f}")
+print(f"Test Recall: {recall:.4f}")
+print(f"Test F1 Score: {f1:.4f}")
+
+# Display confusion matrix (already computed)
+print("Test Confusion Matrix:")
+print(test_conf_matrix)
+
+# Save confusion matrix as CSV  
+conf_matrix_df = pd.DataFrame(test_conf_matrix, index=['True_0', 'True_1'], columns=['Pred_0', 'Pred_1'])
+conf_matrix_df.to_csv(f'{args.result_dir}/{Model}_test_confusion_matrix_Time_{set_time}.csv', index=True)
+
+# Save results
+results_df = pd.DataFrame(results)
+results_df.to_csv(f'{args.result_dir}/{Model}_grid_search_results_Time_{set_time}.csv', index=False)
+
+# Save best model config and scores to CSV
+best_model_results = {
+    'best_batch_size': best_config['batch_size'],
+    'best_seq_len': best_config['seq_len'],
+    'best_learning_rate': best_config['learning_rate'],
+    'best_scheduler_type': best_config['scheduler_type'],
+    'best_chunking_method': best_config['chunking_method'],
+    'best_chunking_logic_name' : best_config['chunking_logic_name'],
+    'best_logic_function' : best_config['logic_function'],
+    'best_train_accuracy': best_config['train_accuracy'],
+    'best_val_accuracy': best_config['val_accuracy'],
+    'best_val_loss': best_config['val_loss'],
+    'test_precision': precision,
+    'test_recall': recall,
+    'test_f1_score': f1
+}
+best_model_results_df = pd.DataFrame([best_model_results])
+best_model_results_df.to_csv(f'{args.result_dir}/{Model}_best_model_results_Time_{set_time}.csv', index=False)
