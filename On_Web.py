@@ -92,9 +92,18 @@ def chunk_text(tokenizer, text: str, max_tokens: int) -> List[List[int]]:
 # Predict on chunk
 def predict_chunk(model, tokenizer, chunk_tokens: List[int]) -> int:
     import torch.nn.functional as F
-    input_ids = torch.tensor([chunk_tokens])
+
+    # Reconstruct input properly using tokenizer
+    inputs = tokenizer.encode_plus(
+        chunk_tokens,
+        return_tensors="pt",
+        padding="max_length",
+        max_length=MAX_TOKENS,
+        truncation=True
+    )
+
     with torch.no_grad():
-        outputs = model(input_ids)
+        outputs = model(**inputs)
         logits = outputs.logits
         probs = F.softmax(logits, dim=1)
         return torch.argmax(probs, dim=1).item()
