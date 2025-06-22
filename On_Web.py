@@ -84,24 +84,24 @@ def load_models_and_tokenizers():
 
 # --------------------
 # Chunking
-def chunk_text(tokenizer, text: str, max_tokens: int) -> List[List[int]]:
+def chunk_text(tokenizer, text: str, max_tokens: int) -> List[str]:
     tokens = tokenizer.encode(text, add_special_tokens=True)
-    return [tokens[i:i + max_tokens] for i in range(0, len(tokens), max_tokens)]
+    chunks = [tokens[i:i + max_tokens] for i in range(0, len(tokens), max_tokens)]
+    return [tokenizer.decode(chunk, skip_special_tokens=True) for chunk in chunks]
+
 
 # --------------------
 # Predict on chunk
-def predict_chunk(model, tokenizer, chunk_tokens: List[int]) -> int:
+def predict_chunk(model, tokenizer, chunk_text: str) -> int:
     import torch.nn.functional as F
 
-    # Reconstruct input properly using tokenizer
-    inputs = tokenizer.encode_plus(
-        chunk_tokens,
+    inputs = tokenizer(
+        chunk_text,
         return_tensors="pt",
         padding="max_length",
+        truncation=True,
         max_length=MAX_TOKENS,
-        truncation=True
     )
-
     with torch.no_grad():
         outputs = model(**inputs)
         logits = outputs.logits
