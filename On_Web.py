@@ -5,6 +5,7 @@ import streamlit as st
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from typing import List
 from pathlib import Path
+import torch.nn.functional as F
 
 # --------------------
 # Config
@@ -25,7 +26,7 @@ s3 = boto3.client(
 
 MODEL_INFO = {
     "Data Class": {
-        "s3_prefix": "data class/CodeT5_Data_Class",  # folder in S3
+        "s3_prefix": "data class/CodeT5_Data_Class",
         "local_dir": "models/data_class",
         "tokenizer_name": "Salesforce/codet5-base",
     },
@@ -49,16 +50,13 @@ MODEL_INFO = {
 MAX_TOKENS = 512
 
 # --------------------
-# Download model folder from S3 if not already downloaded
 def download_model_folder_from_s3(bucket: str, prefix: str, local_dir: str):
     if Path(local_dir).exists():
-        # st.write(f"✔️ Model already cached at `{local_dir}`.")
         return
 
     s3 = boto3.client("s3")
     paginator = s3.get_paginator("list_objects_v2")
-    # st.write(f"⬇ Downloading model files from `s3://{bucket}/{prefix}`...")
-    
+
     for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
         for obj in page.get("Contents", []):
             s3_key = obj["Key"]
@@ -66,10 +64,8 @@ def download_model_folder_from_s3(bucket: str, prefix: str, local_dir: str):
             local_path = os.path.join(local_dir, rel_path)
             os.makedirs(os.path.dirname(local_path), exist_ok=True)
             s3.download_file(bucket, s3_key, local_path)
-            # st.write(f"  ✅ {rel_path}")
 
 # --------------------
-# Load models and tokenizers
 @st.cache_resource(show_spinner=False)
 def load_models_and_tokenizers():
     models = {}
@@ -83,15 +79,12 @@ def load_models_and_tokenizers():
     return models, tokenizers
 
 # --------------------
-# Chunking
 def chunk_text(tokenizer, text: str, max_tokens: int) -> List[List[int]]:
     tokens = tokenizer.encode(text, add_special_tokens=True)
     return [tokens[i:i + max_tokens] for i in range(0, len(tokens), max_tokens)]
 
 # --------------------
-# Predict on chunk
 def predict_chunk(model, tokenizer, chunk_tokens: List[int]) -> int:
-    import torch.nn.functional as F
     input_ids = torch.tensor([chunk_tokens])
     with torch.no_grad():
         outputs = model(input_ids)
@@ -100,7 +93,6 @@ def predict_chunk(model, tokenizer, chunk_tokens: List[int]) -> int:
         return torch.argmax(probs, dim=1).item()
 
 # --------------------
-# Predict full text
 def predict_smell_for_text(model, tokenizer, text: str) -> str:
     chunks = chunk_text(tokenizer, text, MAX_TOKENS)
     for chunk in chunks:
@@ -109,32 +101,46 @@ def predict_smell_for_text(model, tokenizer, text: str) -> str:
     return "Non-smell"
 
 # --------------------
-# Streamlit UI
+def get_token_info(tokenizer, text: str, max_tokens: int):
+    tokens = tokenizer.encode(text, add_special_tokens=True)
+    num_tokens = len(tokens)
+    num_chunks = (num_tokens + max_tokens - 1) // max_tokens  # ceiling division
+    return num_tokens, num_chunks
+
+# --------------------
 def main():
     st.set_page_config(page_title="Code Smell Detector", layout="wide")
     st.title("🧠 Code Smell Detector")
-    st.write("Paste your code below to detect 4 type of code smells: Data Class, God Class, Feature Envy & Long Method.")
+    st.write("Paste your code below to detect 4 types of code smells: **Data Class**, **God Class**, **Feature Envy**, and **Long Method**.")
 
     models, tokenizers = load_models_and_tokenizers()
 
-    code_input = st.text_area("Paste your code here:", height=300)
+    code_input = st.text_area("📥 Paste your code here:", height=300)
 
     if st.button("🔍 Detect Code Smells"):
         if not code_input.strip():
             st.warning("⚠️ Please enter some code to analyze.")
             return
 
-        st.write("🔎 Analyzing...")
+        # Use any tokenizer (they all tokenize similarly for stats)
+        example_tokenizer = next(iter(tokenizers.values()))
+        num_tokens, num_chunks = get_token_info(example_tokenizer, code_input, MAX_TOKENS)
+
+        st.subheader("📏 Input Summary")
+        st.write(f"**Total Tokens:** {num_tokens}")
+        st.write(f"**Total Chunks (max {MAX_TOKENS} tokens each):** {num_chunks}")
+
+        st.subheader("📊 Prediction Results")
         results = {}
         for smell, model in models.items():
             tokenizer = tokenizers[smell]
             result = predict_smell_for_text(model, tokenizer, code_input)
             results[smell] = result
 
-        st.subheader("📊 Prediction Results")
         for smell, result in results.items():
             emoji = "⚠️" if result == "Smell" else "✅"
             st.write(f"{emoji} **{smell}:** {result}")
 
+# --------------------
 if __name__ == "__main__":
     main()
